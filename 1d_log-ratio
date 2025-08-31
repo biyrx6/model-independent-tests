@@ -1,0 +1,225 @@
+# -*- coding: utf-8 -*-
+"""
+Neural Network Based Density-Ratio Test
+- Poisson total count: n ~ Poisson(N(R0))
+- Binomial split for signal: n_s ~ Binomial(n, lambda), n_b = n - n_s
+- Background pdf: truncated exponential on [0,1], rate=8
+- Signal pdf: truncated Gaussian N(0.8, 0.02) truncated to [0,1]
+- Loss:  L = - sum_{x in W} f(x) + sum_{(x,w) in R} w (exp(f(x)) - 1)
+- Test statistic: T = -2 * min L
+"""
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+# =========================
+# Reproducibility & Device
+# =========================
+SEED = 718
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# =========================
+# Experiment Config
+# =========================
+INPUT_DIM   = 1
+HIDDEN_DIM  = 4
+EPOCHS      = 150000
+LR          = 1e-3
+CLIP        = 9.0
+
+B_exp       = 2000            # N(R0): expected total count under the reference model (fixed)
+LAMBDA_FRAC = 0.10            # λ: signal fraction in observed data (0–1)
+N_R_BIG     = 200000          # size of the large reference sample
+
+# =========================
+# Distributions
+# =========================
+def sample_exp_minus8(n: int) -> np.ndarray:
+    """Sample from truncated exponential on [0,1] with rate=8."""
+    u = np.random.rand(n)
+    return -np.log(1.0 - u * (1.0 - np.exp(-8.0))) / 8.0
+
+def pr_pdf(x):
+    """Background pdf p_R(x) on [0,1]."""
+    C = 8.0 / (1.0 - np.exp(-8.0))
+    return C * np.exp(-8.0 * x)
+
+def ps_pdf(x, mu=0.8, sigma=0.02):
+    """Signal pdf p_S(x): truncated Gaussian on [0,1]."""
+    from math import erf, sqrt
+    Z = 0.5*(1+erf((1-mu)/(sigma*sqrt(2)))) - 0.5*(1+erf((0-mu)/(sigma*sqrt(2))))
+    base = np.exp(-0.5*((x-mu)/sigma)**2)/(sigma*np.sqrt(2*np.pi))
+    return np.where((0<=x)&(x<=1), base / Z, 0.0)
+
+def sample_signal_gauss(n, mu=0.8, sigma=0.02):
+    """Sample truncated Gaussian on [0,1] via rejection sampling."""
+    if n <= 0:
+        return np.empty((0,), dtype=float)
+    xs = []
+    while len(xs) < n:
+        z = np.random.normal(mu, sigma, size=n)
+        z = z[(z>=0)&(z<=1)]
+        xs.extend(z.tolist())
+    return np.array(xs[:n])
+
+# =========================
+# Build Reference / Observed Data
+# =========================
+def make_reference():
+    """
+    Reference sample R: m=N_R_BIG points from p_R,
+    each with weight w_e = B_exp / m so that sum w = B_exp.
+    """
+    xR = sample_exp_minus8(N_R_BIG).astype(np.float32).reshape(-1,1)
+    wR = np.full((N_R_BIG,), B_exp / N_R_BIG, dtype=np.float32)
+    return torch.from_numpy(xR).to(device), torch.from_numpy(wR).to(device)
+
+def make_data_totalfrac():
+    """
+    Observed dataset W:
+      1) Draw total n ~ Poisson(N(R0)=B_exp)
+      2) Draw signal count n_s ~ Binomial(n, λ); n_b = n - n_s
+      3) Sample n_b from p_R, n_s from p_S; shuffle
+    """
+    n = np.random.poisson(B_exp)
+    n_s = np.random.binomial(n, LAMBDA_FRAC) if n > 0 else 0
+    n_b = n - n_s
+    xb = sample_exp_minus8(n_b)
+    xs = sample_signal_gauss(n_s)
+    xD = np.concatenate([xb, xs]).astype(np.float32) if n > 0 else np.empty((0,), np.float32)
+    np.random.shuffle(xD)
+    return torch.from_numpy(xD.reshape(-1,1)).to(device), n_b, n_s, n
+
+# =========================
+# True log-ratio for diagnostics
+# Note: under this setup, n_H/n_R = (1-λ) + λ (p_S/p_R)
+# =========================
+def true_log_ratio_fixed_total(x):
+    x = np.asarray(x)
+    ratio = (1.0 - LAMBDA_FRAC) + LAMBDA_FRAC * (ps_pdf(x) / pr_pdf(x))
+    # guard against tiny values
+    ratio = np.clip(ratio, 1e-12, None)
+    return np.log(ratio)
+
+# =========================
+# Model & Training
+# =========================
+class SimpleNN(nn.Module):
+    def __init__(self, clip_val=CLIP):
+        super().__init__()
+        self.fc1 = nn.Linear(INPUT_DIM, HIDDEN_DIM)
+        self.fc2 = nn.Linear(HIDDEN_DIM, 1)
+        self.act = nn.Sigmoid()
+        self.clip_val = clip_val
+    def forward(self, x):
+        h = self.act(self.fc1(x))
+        return self.fc2(h)
+    def clip_weights(self):
+        for p in self.parameters():
+            p.data.clamp_(-self.clip_val, self.clip_val)
+
+def loss_fn(fD, fR, wR):
+    """
+    L = - sum_{x in W} f(x) + sum_{(x,w) in R} w (exp(f(x)) - 1)
+    """
+    term_data = -fD.sum() if fD.numel() > 0 else torch.tensor(0.0, device=fD.device)
+    term_ref  = torch.sum(wR * (torch.exp(fR) - 1.0))
+    return term_data + term_ref
+
+def train_once(xR, wR, xD, epochs=EPOCHS, lr=LR, clip=CLIP):
+    model = SimpleNN(clip).to(device)
+    opt = optim.Adam(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad(set_to_none=True)
+        fD = model(xD).squeeze() if xD.numel() > 0 else torch.zeros((), device=device)
+        fR = model(xR).squeeze()
+        loss = loss_fn(fD, fR, wR)
+        loss.backward()
+        opt.step()
+        model.clip_weights()
+    with torch.no_grad():
+        fD = model(xD).squeeze() if xD.numel() > 0 else torch.zeros((), device=device)
+        fR = model(xR).squeeze()
+        T = (-2.0 * loss_fn(fD, fR, wR)).item()
+    return model, T
+
+# =========================
+# Main
+# =========================
+def main():
+    # Reference
+    xR, wR = make_reference()
+
+    # Observed data (one toy)
+    xD, n_bkg, n_sig, n_tot = make_data_totalfrac()
+    print(f"[toy] n_tot={n_tot}, n_bkg={n_bkg}, n_sig={n_sig}, Ref size={xR.shape[0]}")
+
+    # Train and get T
+    model, T = train_once(xR, wR, xD)
+    print(f"T (single toy) = {T:.3f}")
+
+    # ---- Plot 1: True vs NN-estimated log-ratio ----
+    grid = np.linspace(0, 1, 600, dtype=np.float32).reshape(-1,1)
+    with torch.no_grad():
+        f_grid = model(torch.from_numpy(grid).to(device)).cpu().numpy().squeeze()
+    true_lr = true_log_ratio_fixed_total(grid.squeeze())
+
+    plt.figure(figsize=(7,4))
+    plt.plot(grid, true_lr, lw=2, label='True log-ratio')
+    plt.plot(grid, f_grid, lw=2, linestyle='--', label='NN estimate $f(x)$')
+    plt.xlabel('x'); plt.ylabel('log-ratio')
+    plt.title('True vs NN-estimated log-ratio')
+    plt.legend(); plt.grid(alpha=0.4, ls='--'); plt.tight_layout(); plt.show()
+
+    # ---- Plot 2: Data vs Reweighted Reference ----
+    with torch.no_grad():
+        w_rew = torch.exp(model(xR).squeeze()).cpu().numpy() * wR.cpu().numpy()
+    xR_np = xR.cpu().numpy().squeeze()
+    xD_np = xD.cpu().numpy().squeeze()
+
+    plt.figure(figsize=(7,4))
+    if xD_np.size > 0:
+        counts_D, bins, _ = plt.hist(xD_np, bins=60, range=(0,1),
+                                     alpha=0.5, label='Data (Observed)', edgecolor='k')
+        bin_centers = 0.5*(bins[:-1]+bins[1:])
+        inds = np.digitize(xR_np, bins)-1
+        inds = np.clip(inds, 0, len(bin_centers)-1)
+        wsum = np.bincount(inds, weights=w_rew, minlength=len(bin_centers))
+        plt.step(bin_centers, wsum, where='mid', lw=2, label='Reweighted Ref ($e^{f(x)}$)')
+    else:
+        # Guard for the rare case n=0
+        plt.hist([], bins=60, range=(0,1), alpha=0.5, label='Data (empty)')
+    plt.xlabel('x'); plt.ylabel('Counts (per bin)')
+    plt.title('Data vs Reweighted Reference')
+    plt.legend(); plt.grid(alpha=0.4, ls='--'); plt.tight.tight_layout(); plt.show()
+
+    # ---- Plot 3: Pointwise True vs Estimated (on reference points) ----
+    take = min(5000, len(xR_np))
+    sel = np.random.choice(len(xR_np), size=take, replace=False)
+    x_s = xR_np[sel]
+    with torch.no_grad():
+        f_s = model(torch.from_numpy(x_s.reshape(-1,1)).to(device)).cpu().numpy().squeeze()
+    true_s = true_log_ratio_fixed_total(x_s)
+
+    plt.figure(figsize=(5.2,5))
+    plt.scatter(true_s, f_s, s=8, alpha=0.4)
+    lo = float(min(true_s.min(), f_s.min()))
+    hi = float(max(true_s.max(), f_s.max()))
+    plt.plot([lo,hi],[lo,hi],'r--', lw=2)
+    plt.xlabel('True log-ratio'); plt.ylabel('NN estimate $f(x)$')
+    plt.title('Pointwise: True vs Estimated')
+    plt.grid(alpha=0.4, ls='--'); plt.tight_layout(); plt.show()
+
+if __name__ == "__main__":
+    main()
