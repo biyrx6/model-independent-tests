@@ -11,19 +11,17 @@ from scipy.stats import chi2, kstest
 import matplotlib.pyplot as plt
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-
-
-# =============== 可复现 & 设备 ===============
+# =============== Reproducibility & Device ===============
 SEED = 718
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("✅ Using device:", device)
+print(" Using device:", device)
 
-# =============== 数据路径与特征列 ===============
-INPUT_CSV = r"C:\Users\郭嘉英\OneDrive\Desktop\PHYSICAL_DATA_log.csv"  # ← 改成你的实际路径
+# =============== Data path & feature columns ===============
+INPUT_CSV = r"C:\Users\ruixu\OneDrive\Desktop\PHYSICAL_DATA_log.csv"  # ← change to your actual path
 feature_cols = [
     "tau_pt","tau_eta","tau_phi",
     "lep_pt","lep_eta","lep_phi",
@@ -34,14 +32,14 @@ feature_cols = [
 ]
 label_col  = "Label"  # 's' / 'b'
 
-# =============== 实验设置 ===============
-N_R   = 40403                     # 参考集 R：固定这么多背景
-N_R0  = 20000                     # 实验集 W 的 Poisson 均值
-LAMBDAS   = [0.1]  # 扫一些 λ
-NUM_TOYS  = 50                    # 每个 λ 的 toy Y数
-USE_REPLACE_SAMPLING = True       # 有放回抽样（推荐；toys 独立同分布）
+# =============== Experiment settings ===============
+N_R   = 40403                     # Reference set R size (background only; fixed once)
+N_R0  = 20000                     # Poisson mean for experimental set W
+LAMBDAS   = [0.1]                 # λ values to scan
+NUM_TOYS  = 50                    # number of toys per λ
+USE_REPLACE_SAMPLING = True       # sample with replacement (recommended; i.i.d. toys)
 
-# =============== 网络超参（15→64→32→1） ===============
+# =============== Network hyperparameters (15→24→12→1) ===============
 INPUT_DIM = len(feature_cols)   # 15
 H1, H2    = 24, 12
 OUTPUT_DIM = 1
@@ -50,37 +48,37 @@ LR        = 1e-3
 CLIP_VALUE = 0.22
 PRINT_EVERY_EPOCH = 10000
 
-# 自由度（参数个数）
+# Degrees of freedom (parameter count)
 DF_FIXED = (INPUT_DIM*H1 + H1) + (H1*H2 + H2) + (H2*OUTPUT_DIM + OUTPUT_DIM)
 print("DOF =", DF_FIXED)
 
-# =============== 读取数据，分 R/W 池 ===============
+# =============== Read data and split background/signal pools ===============
 df = pd.read_csv(INPUT_CSV)
-# 只保留 15 个特征 + Label，并把特征转 float32
+# keep only the 15 features + Label; cast features to float32
 df = df[feature_cols + [label_col]].dropna().copy()
 df[feature_cols] = df[feature_cols].astype(np.float32)
 
-# 背景池 / 信号池
+# background / signal pools
 df_bkg = df[df[label_col] == 'b'].reset_index(drop=True)
 df_sig = df[df[label_col] == 's'].reset_index(drop=True)
 
 if len(df_bkg) < N_R:
-    raise ValueError(f"背景池不足：需要 N_R={N_R}，但只有 {len(df_bkg)} 条 'b'。")
+    raise ValueError(f"Not enough background rows: need N_R={N_R}, but only {len(df_bkg)} 'b' available.")
 
-# 固定参考集 R：从背景池随机取 N_R 个（固定一次）
+# Fix reference set R once from the background pool
 rng = np.random.default_rng(SEED)
 idx_R = rng.choice(len(df_bkg), size=N_R, replace=False)
 X_R_np = df_bkg.loc[idx_R, feature_cols].to_numpy(np.float32)  # (N_R, 15)
 X_R = torch.from_numpy(X_R_np).to(device)
 
-# 实验池：去掉已经用于 R 的背景，其余背景 + 全部信号
+# Experimental pools: remaining background (excluding R) + all signal
 bkg_pool = df_bkg.drop(index=idx_R).reset_index(drop=True)[feature_cols].to_numpy(np.float32)
 sig_pool = df_sig[feature_cols].to_numpy(np.float32)
 
-# 参考项权重：w_e = N_R0 / N_R
+# Reference weight term: w_e = N_R0 / N_R (NPL extended-likelihood)
 w_e_scalar = float(N_R0) / float(N_R)
 
-# =============== 网络结构 ===============
+# =============== Network architecture ===============
 class SimpleNN(nn.Module):
     def __init__(self, clip_val):
         super().__init__()
@@ -102,7 +100,7 @@ class SimpleNN(nn.Module):
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-# =============== 采样工具（等概率；不使用 Weight） ===============
+# =============== Sampling utility (uniform; no per-row weights) ===============
 def sample_pool(pool: np.ndarray, n: int, replace: bool) -> np.ndarray:
     if n <= 0:
         return np.empty((0, pool.shape[1]), dtype=np.float32)
@@ -110,11 +108,11 @@ def sample_pool(pool: np.ndarray, n: int, replace: bool) -> np.ndarray:
         idx = rng.integers(0, len(pool), size=n)
     else:
         if n > len(pool):
-            raise RuntimeError(f"不放回抽样需要 {n}，但池子只剩 {len(pool)}")
+            raise RuntimeError(f"Sampling without replacement needs {n}, but pool has only {len(pool)}.")
         idx = rng.choice(len(pool), size=n, replace=False)
     return pool[idx]
 
-# =============== 生成单个 toy 的 W（R 已经固定） ===============
+# =============== Generate a single toy W (R is already fixed) ===============
 def generate_W(lambda_val: float, replace: bool = True):
     # M ~ Poisson(N_R0)
     M = rng.poisson(N_R0)
@@ -126,22 +124,22 @@ def generate_W(lambda_val: float, replace: bool = True):
         Xs = sample_pool(sig_pool, n_sig, replace)
         Xb = sample_pool(bkg_pool, n_bkg, replace)
         X_W = np.vstack([Xs, Xb]).astype(np.float32)
-        # 打乱
+        # shuffle within W
         perm = rng.permutation(len(X_W))
         X_W = X_W[perm]
-    # 按你的要求：W 内部不区分 s/b，**全标 1**
+    # By design: within W we do not keep s/b labels—mark all as class 1
     y_W = np.ones((X_W.shape[0],), dtype=np.float32)
     return torch.from_numpy(X_W).to(device), torch.from_numpy(y_W).to(device)
 
-# =============== NPLM 损失 ===============
+# =============== NPLM loss ===============
 def nplm_unified_loss(fZ, yZ, w_ref_scalar):
     # L = sum[(1-y) * w_e * (exp(f)-1) - y * f]
     return torch.sum((1.0 - yZ) * w_ref_scalar * (torch.exp(fZ) - 1.0) - yZ * fZ)
 
-# =============== 训练一个 toy 并返回 T = -2*min L ===============
+# =============== Train for one toy and return T = -2*min L ===============
 def train_and_score_one_toy(lambda_val: float):
     X_W, y_W = generate_W(lambda_val, replace=USE_REPLACE_SAMPLING)
-    # 组 Z = R ∪ W，R 全 0，W 全 1
+    # Build Z = R ∪ W; R → 0, W → 1
     X_Z = torch.cat([X_R, X_W], dim=0)
     y_Z = torch.cat([
         torch.zeros((X_R.shape[0],), dtype=torch.float32, device=device),  # R -> 0
@@ -167,7 +165,7 @@ def train_and_score_one_toy(lambda_val: float):
         T = -2.0 * final_loss
     return T, count_params(model)
 
-# =============== 主流程 ===============
+# =============== Main ===============
 def main():
     print(f"\nN_R = {N_R}, N_R0 = {N_R0}, w_e = {w_e_scalar:.6f}, DOF = {DF_FIXED}")
     results = {}
@@ -182,20 +180,20 @@ def main():
             print(f"  Toy {i:02d}/{NUM_TOYS}: T = {T:.3f}")
         results[lam] = {"Ts": np.asarray(Ts, dtype=float), "dof": dof_once}
 
-    # 只在 λ=0 时做 KS（检验 p 是否近似 U(0,1)）
+    # Only run KS at λ = 0 (test whether p-values ~ Uniform(0,1))
     if 0.0 in results:
         Ts0 = results[0.0]["Ts"]
         pvals0 = 1.0 - chi2.cdf(Ts0, df=DF_FIXED)
         ks_stat, ks_p = kstest(pvals0, 'uniform')
         print(f"\n[λ=0] KS vs U(0,1): stat = {ks_stat:.4f}, p = {ks_p:.4f}")
     return results
+
 if __name__ == "__main__":
     results = main()
 
-    # ===== 保存 T 值到 JSON（含 DOF 与元信息）=====
+    # ===== Save T values to JSON (with DOF and metadata) =====
     out_dict = {
         "meta": {
-
             "seed": SEED,
             "device": str(device),
             "epochs": EPOCHS,
@@ -224,13 +222,13 @@ if __name__ == "__main__":
     }
     with open("T_value_WITHLAM0.1.json", "w", encoding="utf-8") as f:
         json.dump(out_dict, f, indent=2, ensure_ascii=False)
-    print("✅ 已保存到 T_value_WITHLAM0.1.json")
+    print("✅ Saved to T_value_WITHLAM0.1.json")
 
-    # ====== 可视化：T 直方图 + p-value CDF ======
+    # ====== Visualization: T histogram + p-value CDF ======
     for lam, pack in results.items():
         Ts = pack["Ts"]
 
-        # T 直方图 vs 理论 chi^2_DOF
+        # T histogram vs theoretical chi^2_DOF
         plt.figure(figsize=(6.4,4.6))
         plt.hist(Ts, bins=25, density=True, alpha=0.45, edgecolor='black', label='Empirical $P(T)$')
         xs = np.linspace(0, max(Ts.max(), 1)*1.1, 600)
