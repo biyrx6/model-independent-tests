@@ -9,7 +9,7 @@ from sklearn.metrics import roc_auc_score
 # 1) Path & random seed
 # =========================
 # Point to your CSV file: this is the “log-transformed” CSV (PRI_jet_num=2 and column names per the paper)
-INPUT_CSV = r"C:\Users\郭嘉英\OneDrive\Desktop\PHYSICAL_DATA_log.csv"
+INPUT_CSV = r"C:\Users\ruixu\OneDrive\Desktop\PHYSICAL_DATA_log.csv"
 np.random.seed(718)
 
 # =========================
