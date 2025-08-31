@@ -1,0 +1,304 @@
+# -*- coding: utf-8 -*-
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.stats import multivariate_normal
+from scipy.stats import mvn
+
+# ========== Global settings ==========
+SEED = 718
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ========== Hyperparameters ==========
+INPUT_DIM = 2
+EPOCHS = 80000
+LR = 1e-3
+CLIP = 3.53
+
+B_exp = 2000
+LAMBDA_FRAC = 0.01
+N_R_BIG = 200000
+
+# ========== Sampling functions ==========
+def sample_exp_2d(n):
+    """Sample 2D truncated exponential on [0,1]^2 with rate=8 (independent along each axis)."""
+    u = np.random.rand(n, INPUT_DIM)
+    return -np.log(1.0 - u * (1 - np.exp(-8.0))) / 8.0
+
+def sample_trunc_gauss_2d(n, mu=0.4, sigma=0.02):
+    """Sample 2D truncated Gaussian on [0,1]^2 by rejection sampling."""
+    samples = []
+    while len(samples) < n:
+        z = np.random.normal(mu, sigma, size=(n, INPUT_DIM))
+        z = z[(z >= 0).all(axis=1) & (z <= 1).all(axis=1)]
+        samples.extend(z.tolist())
+    return np.array(samples[:n])
+
+def pr_pdf(x):
+    """Background pdf p_R(x) = Exp(8) truncated to [0,1] per axis, independent product."""
+    C = 8.0 / (1.0 - np.exp(-8.0))
+    px = C * np.exp(-8.0 * x[:, 0])
+    py = C * np.exp(-8.0 * x[:, 1])
+    return px * py
+
+def ps_pdf(x, mu=0.4, sigma=0.02):
+    """Signal pdf p_S(x): 2D truncated Gaussian on [0,1]^2 (diagonal covariance)."""
+    mean = np.full(INPUT_DIM, mu)
+    cov = np.eye(INPUT_DIM) * sigma**2
+    Z, _ = mvn.mvnun([0, 0], [1, 1], mean, cov)  # normalization over the unit square
+    mvn_pdf = multivariate_normal(mean=mean, cov=cov)
+    base = mvn_pdf.pdf(x)
+    mask = ((x >= 0) & (x <= 1)).all(axis=1)
+    return np.where(mask, base / Z, 0.0)
+
+def true_log_ratio(x):
+    """Ground-truth log density ratio log( (1-λ) + λ p_S/p_R )."""
+    x = np.asarray(x)
+    ratio = (1 - LAMBDA_FRAC) + LAMBDA_FRAC * (ps_pdf(x) / pr_pdf(x))
+    ratio = np.clip(ratio, 1e-12, None)
+    return np.log(ratio)
+
+# ========== Build datasets ==========
+def make_reference():
+    """
+    Reference sample R: m = N_R_BIG points from p_R,
+    each with weight w_e = B_exp / m so that sum(w_e) = B_exp.
+    """
+    xR = sample_exp_2d(N_R_BIG).astype(np.float32)
+    wR = np.full((N_R_BIG,), B_exp / N_R_BIG, dtype=np.float32)
+    return torch.from_numpy(xR).to(device), torch.from_numpy(wR).to(device)
+
+def make_data():
+    """
+    Observed dataset W:
+      n ~ Poisson(B_exp), n_s ~ Binomial(n, λ), n_b = n - n_s.
+      Sample n_b from p_R and n_s from p_S, then shuffle.
+    """
+    n = np.random.poisson(B_exp)
+    n_s = np.random.binomial(n, LAMBDA_FRAC) if n > 0 else 0
+    n_b = n - n_s
+    xb = sample_exp_2d(n_b)
+    xs = sample_trunc_gauss_2d(n_s)
+    xD = np.concatenate([xb, xs], axis=0).astype(np.float32) if n > 0 else np.empty((0, INPUT_DIM))
+    np.random.shuffle(xD)
+    return torch.from_numpy(xD).to(device), n_b, n_s, n
+
+# ========== Network and training ==========
+class SimpleNN(nn.Module):
+    """(2,5,5,1) architecture; total params (incl. bias) = 51."""
+    def __init__(self, clip_val=CLIP):
+        super().__init__()
+        self.fc1 = nn.Linear(INPUT_DIM, 5)
+        self.fc2 = nn.Linear(5, 5)
+        self.out = nn.Linear(5, 1)
+        self.act = nn.ReLU()          # Tanh can be slightly more stable
+        self.clip_val = clip_val
+    def forward(self, x):
+        h1 = self.act(self.fc1(x))
+        h2 = self.act(self.fc2(h1))
+        return self.out(h2)           # correct output layer
+    def clip_weights(self):
+        for p in self.parameters():
+            p.data.clamp_(-self.clip_val, self.clip_val)
+
+def loss_fn(fD, fR, wR):
+    """
+    NPL loss:
+      L = -sum_{x∈W} f(x) + sum_{(x,w)∈R} w * (exp(f(x)) - 1)
+    """
+    term_data = -fD.sum() if fD.numel() > 0 else torch.tensor(0.0, device=fD.device)
+    term_ref  = torch.sum(wR * (torch.exp(fR) - 1.0))
+    return term_data + term_ref
+
+def train_once(xR, wR, xD):
+    """Train the density-ratio network and return the test statistic T = -2 * min L."""
+    model = SimpleNN().to(device)
+    opt = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)  # light L2 regularization
+    for _ in range(EPOCHS):
+        opt.zero_grad(set_to_none=True)
+        fD = model(xD).squeeze() if xD.numel() > 0 else torch.zeros((), device=device)
+        fR = model(xR).squeeze()
+        loss = loss_fn(fD, fR, wR)
+        loss.backward()
+        opt.step()
+        model.clip_weights()
+    with torch.no_grad():
+        fD = model(xD).squeeze() if xD.numel() > 0 else torch.zeros((), device=device)
+        fR = model(xR).squeeze()
+        T = (-2.0 * loss_fn(fD, fR, wR)).item()
+    return model, T
+
+# ========== Visualization ==========
+def plot_3d_log_ratio(model, title="NN vs True log-ratio"):
+    """3D surfaces: true log-ratio vs NN-estimated f(x)."""
+    grid_size = 60
+    x = np.linspace(0, 1, grid_size)
+    y = np.linspace(0, 1, grid_size)
+    xx, yy = np.meshgrid(x, y)
+    grid_pts = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float32)
+    grid_tensor = torch.from_numpy(grid_pts).to(device)
+    with torch.no_grad():
+        pred = model(grid_tensor).cpu().numpy().squeeze()
+    true = true_log_ratio(grid_pts)
+    fig = plt.figure(figsize=(13, 5))
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.plot_surface(xx, yy, true.reshape(xx.shape), cmap='viridis')
+    ax1.set_title('True log-ratio')
+    ax1.set_xlabel('x'); ax1.set_ylabel('y'); ax1.set_zlabel('log-ratio')
+    ax2 = fig.add_subplot(122, projection='3d')
+    ax2.plot_surface(xx, yy, pred.reshape(xx.shape), cmap='plasma')
+    ax2.set_title('NN estimated $f(x)$')
+    ax2.set_xlabel('x'); ax2.set_ylabel('y'); ax2.set_zlabel('f(x)')
+    plt.tight_layout(); plt.show()
+
+def plot_3d_reweight_hist(xD_np, xR_np, w_rew):
+    """3D surfaces of observed histogram vs reweighted reference histogram."""
+    from scipy.stats import binned_statistic_2d
+    xD_x, xD_y = xD_np[:, 0], xD_np[:, 1]
+    xR_x, xR_y = xR_np[:, 0], xR_np[:, 1]
+    bins = 40
+    stat_D, xedges, yedges = np.histogram2d(xD_x, xD_y, bins=bins, range=[[0,1],[0,1]])
+    stat_R, _, _, _ = binned_statistic_2d(
+        xR_x, xR_y, values=w_rew, statistic='sum', bins=bins, range=[[0,1],[0,1]]
+    )
+    X, Y = np.meshgrid((xedges[:-1]+xedges[1:])/2, (yedges[:-1]+yedges[1:])/2)
+
+    fig = plt.figure(figsize=(13, 5))
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.plot_surface(X, Y, stat_D.T, cmap='viridis')
+    ax1.set_title('Observed Data Histogram')
+    ax1.set_xlabel('x'); ax1.set_ylabel('y'); ax1.set_zlabel('Count')
+
+    ax2 = fig.add_subplot(122, projection='3d')
+    ax2.plot_surface(X, Y, stat_R.T, cmap='plasma')
+    ax2.set_title('Reweighted Reference ($e^{f(x)}$)')
+    ax2.set_xlabel('x'); ax2.set_ylabel('y'); ax2.set_zlabel('Weight Sum')
+    plt.tight_layout(); plt.show()
+
+def plot_scatter_true_vs_pred(xR_np, model):
+    """3D scatter: true log-ratio vs estimated f(x) vs absolute error."""
+    sel = np.random.choice(len(xR_np), size=5000, replace=False)
+    x_s = xR_np[sel]
+    with torch.no_grad():
+        f_pred = model(torch.from_numpy(x_s.astype(np.float32)).to(device)).cpu().numpy().squeeze()
+    f_true = true_log_ratio(x_s)
+
+    fig = plt.figure(figsize=(6,6))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(f_true, f_pred, np.abs(f_true - f_pred), s=8, alpha=0.4)
+    ax.set_xlabel("True log-ratio"); ax.set_ylabel("Estimated $f(x)$"); ax.set_zlabel("Absolute Error")
+    ax.set_title("Pointwise Comparison")
+    plt.tight_layout(); plt.show()
+
+def plot_heatmap_reweight_hist(xD_np, xR_np, w_rew, bins=40):
+    """Heatmaps of observed histogram and reweighted reference histogram."""
+    from scipy.stats import binned_statistic_2d
+    xD_x, xD_y = xD_np[:, 0], xD_np[:, 1]
+    xR_x, xR_y = xR_np[:, 0], xR_np[:, 1]
+
+    # Observed histogram
+    stat_D, xedges, yedges = np.histogram2d(xD_x, xD_y, bins=bins, range=[[0,1],[0,1]])
+
+    # Reweighted reference histogram
+    stat_R, _, _, _ = binned_statistic_2d(
+        xR_x, xR_y, values=w_rew, statistic='sum', bins=bins, range=[[0,1],[0,1]]
+    )
+
+    extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
+
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    im1 = axs[0].imshow(stat_D.T, origin='lower', extent=extent, cmap='viridis', aspect='auto')
+    axs[0].set_title("Observed Data Histogram")
+    axs[0].set_xlabel("x"); axs[0].set_ylabel("y")
+    plt.colorbar(im1, ax=axs[0], label="Count")
+
+    im2 = axs[1].imshow(stat_R.T, origin='lower', extent=extent, cmap='plasma', aspect='auto')
+    axs[1].set_title(r"Reweighted Reference ($e^{f(x)}$)")
+    axs[1].set_xlabel("x"); axs[1].set_ylabel("y")
+    plt.colorbar(im2, ax=axs[1], label="Weight Sum")
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_heatmap_fx(model, title="Heatmap of $f(x)$", grid_size=60):
+    """Heatmap of the learned f(x) on a uniform grid over [0,1]^2."""
+    x = np.linspace(0, 1, grid_size)
+    y = np.linspace(0, 1, grid_size)
+    xx, yy = np.meshgrid(x, y)
+    grid_pts = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float32)
+    grid_tensor = torch.from_numpy(grid_pts).to(model.fc1.weight.device)
+    with torch.no_grad():
+        fx = model(grid_tensor).cpu().numpy().squeeze()
+    fx_img = fx.reshape(xx.shape)
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(fx_img, origin='lower', extent=[0, 1, 0, 1], cmap='plasma', aspect='auto')
+    plt.colorbar(label='$f(x)$')
+    plt.title(title)
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.tight_layout()
+    plt.show()
+
+def plot_heatmap_true_vs_pred(model, true_log_ratio, grid_size=60):
+    """Side-by-side heatmaps: true log-ratio vs estimated f(x)."""
+    x = np.linspace(0, 1, grid_size)
+    y = np.linspace(0, 1, grid_size)
+    xx, yy = np.meshgrid(x, y)
+    grid_pts = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float32)
+    grid_tensor = torch.from_numpy(grid_pts).to(model.fc1.weight.device)
+    with torch.no_grad():
+        fx = model(grid_tensor).cpu().numpy().squeeze()
+    fx_true = true_log_ratio(grid_pts)
+    fx_img = fx.reshape(xx.shape)
+    fx_true_img = fx_true.reshape(xx.shape)
+
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    im0 = axs[0].imshow(fx_true_img, origin='lower', extent=[0, 1, 0, 1], cmap='viridis', aspect='auto')
+    axs[0].set_title("True log-ratio")
+    axs[0].set_xlabel("x")
+    axs[0].set_ylabel("y")
+    plt.colorbar(im0, ax=axs[0], label='log-ratio')
+
+    im1 = axs[1].imshow(fx_img, origin='lower', extent=[0, 1, 0, 1], cmap='plasma', aspect='auto')
+    axs[1].set_title("Estimated $f(x)$")
+    axs[1].set_xlabel("x")
+    axs[1].set_ylabel("y")
+    plt.colorbar(im1, ax=axs[1], label='$f(x)$')
+
+    plt.tight_layout()
+    plt.show()
+
+# ========== Main ==========
+def main():
+    xR, wR = make_reference()
+    xD, n_bkg, n_sig, n_tot = make_data()
+    print(f"[toy] n_total={n_tot}, bkg={n_bkg}, sig={n_sig}")
+    model, T = train_once(xR, wR, xD)
+    print(f"Test statistic T = {T:.3f} | dof (2,5,5,1) = 51")
+
+    # Plots
+    plot_3d_log_ratio(model)
+    xR_np = xR.cpu().numpy()
+    xD_np = xD.cpu().numpy()
+    with torch.no_grad():
+        w_rew = torch.exp(model(xR).squeeze()).cpu().numpy() * wR.cpu().numpy()
+    plot_3d_reweight_hist(xD_np, xR_np, w_rew)
+    plot_scatter_true_vs_pred(xR_np, model)
+    plot_heatmap_fx(model)
+    plot_heatmap_true_vs_pred(model, true_log_ratio)
+    plot_heatmap_reweight_hist(xD_np, xR_np, w_rew)
+
+if __name__ == "__main__":
+    main()
