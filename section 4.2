@@ -1,0 +1,263 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from scipy.stats import norm
+from sklearn.metrics import roc_auc_score
+
+# =========================
+# 1) Path & random seed
+# =========================
+# Point to your CSV file: this is the “log-transformed” CSV (PRI_jet_num=2 and column names per the paper)
+INPUT_CSV = r"C:\Users\郭嘉英\OneDrive\Desktop\PHYSICAL_DATA_log.csv"
+np.random.seed(718)
+
+# =========================
+# 2) Dataset sizes & λ (per the paper)
+# =========================
+# Sizes (Section 6)
+mb = 40403          # pure background pool size
+ms = 20403          # pure signal pool size
+n  = 40403          # experimental (mixture) pool size
+
+# Train/test split (data-splitting)
+m1, m2 = 20403, 20000   # background train/test
+n1, n2 = 20403, 20000   # experimental train/test
+
+# λ list: includes H0=0 and spans 0.15→0.01 as in the paper
+lambda_list = [0.0, 0.01, 0.03, 0.05, 0.07, 0.10, 0.15]
+repeats = 50  # use 50 repetitions as in the paper’s power experiments
+
+# RandomForest hyperparameters (align with your simulation settings)
+RF_KW = dict(
+    n_estimators=50,
+    max_depth=5,
+    min_samples_leaf=50,
+    n_jobs=-1
+)
+
+# =========================
+# 3) Utilities
+# =========================
+def compute_log_psi(probs, pi):
+    """log ψ̂(p) = log(((1-π)/π) * p/(1-p))."""
+    probs = np.clip(probs, 1e-6, 1 - 1e-6)
+    psi = (1 - pi) / pi * probs / (1 - probs)
+    return np.log(psi)
+
+def weighted_choice_n(idx, weights, size):
+    """
+    Weighted sampling without replacement: draw `size` indices from `idx`
+    with probabilities proportional to `weights`. Weights are normalized within `idx`.
+    """
+    if size == 0:
+        return np.array([], dtype=int)
+    w = weights[idx].astype(float)
+    w = np.clip(w, a_min=0.0, a_max=None)
+    w = w / w.sum()
+    # NumPy’s choice supports no-replacement sampling with probabilities
+    return np.random.choice(idx, size=size, replace=False, p=w)
+
+# =========================
+# 4) Load data & select columns
+# =========================
+df = pd.read_csv(INPUT_CSV)
+
+# 15 features from Table 2 (already log-transformed) + Weight + Label
+feature_cols = [
+    "tau_pt", "tau_eta", "tau_phi",
+    "lep_pt", "lep_eta", "lep_phi",
+    "met", "met_phi", "met_sumet",
+    "lead_pt", "lead_eta",
+    "sublead_pt", "sublead_eta", "sublead_phi",
+    "all_pt"
+]
+weight_col = "Weight"
+label_col  = "Label"   # 's' / 'b'
+
+# Build global signal/background pools (by row index)
+sig_all = df.index[df[label_col] == 's'].to_numpy()
+bkg_all = df.index[df[label_col] == 'b'].to_numpy()
+
+w_all = df[weight_col].to_numpy()
+
+# =========================
+# 5) Main loop: exact paper-style sampling + your three test statistics
+# =========================
+results = {lam: {"lrt": [], "auc": [], "mce": []} for lam in lambda_list}
+
+for lam in lambda_list:
+    for rep in range(repeats):
+        # ---- 5.1) First, uniformly sample *without replacement* pure background and pure signal from global pools
+        if mb > len(bkg_all) or ms > len(sig_all):
+            raise ValueError("Source pools too small for mb/ms. Reduce sample sizes or change dataset.")
+        # Pure background set (uniform)
+        bkg_set = np.random.choice(bkg_all, size=mb, replace=False)
+        # Remove selected background indices from the pool for later experimental sampling
+        bkg_left_mask = np.ones(len(bkg_all), dtype=bool)
+        bkg_left_mask[np.isin(bkg_all, bkg_set)] = False
+        bkg_left = bkg_all[bkg_left_mask]
+
+        # Pure signal set (uniform)
+        sig_set = np.random.choice(sig_all, size=ms, replace=False)
+        sig_left_mask = np.ones(len(sig_all), dtype=bool)
+        sig_left_mask[np.isin(sig_all, sig_set)] = False
+        sig_left = sig_all[sig_left_mask]
+
+        # ---- 5.2) Build the experimental (mixture) set: #signal ~ Bin(n, λ), using Weight for weighted sampling
+        n_sig = np.random.binomial(n, lam)
+        n_bkg = n - n_sig
+
+        # Weighted (no-replacement) draws from the remaining pools
+        exp_sig_idx = weighted_choice_n(sig_left, w_all, n_sig)
+        # Remove selected signal from the remaining (for completeness)
+        sig_left2_mask = np.ones(len(sig_left), dtype=bool)
+        if n_sig > 0:
+            sig_left2_mask[np.isin(sig_left, exp_sig_idx)] = False
+        sig_left2 = sig_left[sig_left2_mask]
+
+        exp_bkg_idx = weighted_choice_n(bkg_left, w_all, n_bkg)
+        bkg_left2_mask = np.ones(len(bkg_left), dtype=bool)
+        if n_bkg > 0:
+            bkg_left2_mask[np.isin(bkg_left, exp_bkg_idx)] = False
+        bkg_left2 = bkg_left[bkg_left2_mask]
+
+        exp_set = np.concatenate([exp_sig_idx, exp_bkg_idx])
+
+        # ---- 5.3) Data-splitting (per paper): background m1/m2, experimental n1/n2
+        # Background: m1/m2
+        bkg_train_idx = np.random.choice(bkg_set, size=m1, replace=False)
+        bkg_test_idx_mask = np.ones(len(bkg_set), dtype=bool)
+        bkg_test_idx_mask[np.isin(bkg_set, bkg_train_idx)] = False
+        bkg_test_idx = bkg_set[bkg_test_idx_mask]
+        # If the leftover order differs or count is short, trim or refill to m2
+        if len(bkg_test_idx) < m2:
+            bkg_test_idx = np.random.choice(bkg_left2, size=m2, replace=False)
+        else:
+            bkg_test_idx = bkg_test_idx[:m2]
+
+        # Experimental: n1/n2
+        exp_train_idx = np.random.choice(exp_set, size=n1, replace=False)
+        exp_test_idx_mask = np.ones(len(exp_set), dtype=bool)
+        exp_test_idx_mask[np.isin(exp_set, exp_train_idx)] = False
+        exp_test_idx = exp_set[exp_test_idx_mask]
+        if len(exp_test_idx) < n2:
+            # Shouldn’t happen, but top up if needed:
+            need = n2 - len(exp_test_idx)
+            need_sig = min(need, len(sig_left2))
+            add_sig = weighted_choice_n(sig_left2, w_all, need_sig)
+            need_bkg = need - need_sig
+            add_bkg = weighted_choice_n(bkg_left2, w_all, need_bkg)
+            exp_test_idx = np.concatenate([exp_test_idx, add_sig, add_bkg])
+        else:
+            exp_test_idx = exp_test_idx[:n2]
+
+        # ---- 5.4) Extract feature matrices
+        X1 = df.loc[bkg_train_idx, feature_cols].to_numpy()
+        X2 = df.loc[bkg_test_idx , feature_cols].to_numpy()
+
+        W1 = df.loc[exp_train_idx, feature_cols].to_numpy()
+        W2 = df.loc[exp_test_idx , feature_cols].to_numpy()
+
+        # ---- 5.5) Train classifier (same as your previous code)
+        y_back = np.zeros(len(X1), dtype=int)
+        y_exp  = np.ones(len(W1), dtype=int)
+
+        X_train = np.vstack([X1, W1])
+        y_train = np.hstack([y_back, y_exp])
+
+        clf = RandomForestClassifier(random_state=rep, **RF_KW)
+        clf.fit(X_train, y_train)
+
+        # ---- 5.6) Predict probabilities (test sets)
+        pX2 = clf.predict_proba(X2)[:, 1]  # “is experimental” prob on background test
+        pW2 = clf.predict_proba(W2)[:, 1]  # “is experimental” prob on experimental test
+
+        # ---- 5.7) Three statistics (exactly as in your implementation)
+        # (a) LRT (asymptotic z)
+        pi = n1 / (n1 + m1)
+        log_psi_W2 = compute_log_psi(pW2, pi)
+        log_psi_X2 = compute_log_psi(pX2, pi)
+        T_tilde = np.mean(log_psi_W2)
+        T0 = np.mean(log_psi_X2)
+        sigma0_sq = np.var(log_psi_X2, ddof=1)
+        Z_lrt = np.sqrt(n2) * (T_tilde - T0) / np.sqrt(2 * sigma0_sq)
+        p_val_lrt = 1 - norm.cdf(Z_lrt)
+        results[lam]["lrt"].append(p_val_lrt)
+
+        # (b) AUC (variance via the Mann–Whitney null approximation you used)
+        labels_auc = np.concatenate([np.zeros(len(pX2)), np.ones(len(pW2))])
+        scores_auc = np.concatenate([pX2, pW2])
+        theta_hat = roc_auc_score(labels_auc, scores_auc)
+        var_auc_null = (len(pX2) + len(pW2) + 1) / (12.0 * len(pX2) * len(pW2))
+        Z_auc = (theta_hat - 0.5) / np.sqrt(var_auc_null)
+        p_val_auc = 1 - norm.cdf(Z_auc)
+        results[lam]["auc"].append(p_val_auc)
+
+        # (c) MCE (same as your original)
+        pi_thresh = pi
+        mce_fp = np.mean(pX2 > pi_thresh)      # FPR
+        mce_fn = np.mean(pW2 < pi_thresh)      # FNR
+        mce_hat = 0.5 * (mce_fp + mce_fn)
+
+        theta_z_hat = (len(pX2) * mce_fp + len(pW2) * (1 - mce_fn)) / (len(pX2) + len(pW2))
+        var_mce = 0.25 * theta_z_hat * (1 - theta_z_hat) * (1/len(pX2) + 1/len(pW2))
+        Z_mce = (mce_hat - 0.5) / np.sqrt(var_mce)
+        p_val_mce = norm.cdf(Z_mce)  # left-tail
+        results[lam]["mce"].append(p_val_mce)
+
+    print(f"Completed lambda = {lam}")
+
+# =========================
+# 6) Tidy results & visualize (same plotting style)
+# =========================
+records = []
+for lam, stats in results.items():
+    for i, (p_lrt, p_auc, p_mce) in enumerate(
+        zip(stats["lrt"], stats["auc"], stats["mce"]), start=1
+    ):
+        records.append({
+            "Lambda": lam,
+            "Trial": i,
+            "LRT p-value": p_lrt,
+            "AUC p-value": p_auc,
+            "MCE p-value": p_mce
+        })
+
+df_out = pd.DataFrame(records)
+print("\nFirst 10 rows of the p-value table:")
+print(df_out.head(10).to_string(index=False))
+
+# Snapshot tables
+for key, col in [("lrt", "LRT p-value"), ("auc", "AUC p-value"), ("mce", "MCE p-value")]:
+    sub = df_out[["Lambda", "Trial", col]].pivot(index="Trial", columns="Lambda", values=col)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.axis('off')
+    tbl = ax.table(cellText=np.round(sub.values, 4),
+                   rowLabels=sub.index,
+                   colLabels=sub.columns,
+                   cellLoc='center',
+                   loc='center')
+    tbl.scale(1, 1.5)
+    ax.set_title(f"{col} Table", pad=20)
+    plt.tight_layout()
+    plt.show()
+
+# p-value CDFs
+stat_map = {"lrt": "LRT", "auc": "AUC", "mce": "MCE"}
+for key, title in stat_map.items():
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for lam in lambda_list:
+        vals = np.sort(results[lam][key])
+        y = np.arange(1, len(vals) + 1) / len(vals)
+        ax.step(vals, y, where="post", label=f"λ={lam}")
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8)
+    ax.set_xlabel("p-value")
+    ax.set_ylabel("Empirical CDF")
+    ax.set_title(f"{title} p-value CDF")
+    ax.legend(loc="lower right")
+    ax.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+print("\nAll done! (Higgs data, paper-style sampling)")
