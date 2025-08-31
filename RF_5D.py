@@ -158,4 +158,5 @@ for key, title in stat_map.items():
     plt.tight_layout()
     plt.show()
 
+
 print("\nAll done! (figures popped up instead of being saved)")
