@@ -96,7 +96,7 @@ for lam in lambda_list:
         theta_z_hat = (m2 * mce_fp + n2 * (1 - mce_fn)) / (m2 + n2)
         var_mce = 0.25 * theta_z_hat * (1 - theta_z_hat) * (1/m2 + 1/n2)
         Z_mce = (mce_hat - 0.5) / np.sqrt(var_mce)
-        p_val_mce = norm.cdf(Z_mce)  # 左尾
+        p_val_mce = norm.cdf(Z_mce)  
         results[lam]["mce"].append(p_val_mce)
 
     print(f"Completed lambda = {lam}")
@@ -122,7 +122,7 @@ print("\nFirst 10 rows of p-value table:")
 print(df.head(10).to_string(index=False))
 
 # ----------------------------
-# Show p-value tables as figures (弹窗)
+# Show p-value tables as figures 
 # ----------------------------
 for key, col in [("lrt", "LRT p-value"), ("auc", "AUC p-value"), ("mce", "MCE p-value")]:
     sub = df[["Lambda", "Trial", col]].pivot(index="Trial", columns="Lambda", values=col)
@@ -139,7 +139,7 @@ for key, col in [("lrt", "LRT p-value"), ("auc", "AUC p-value"), ("mce", "MCE p-
     plt.show()
 
 # ----------------------------
-# Plot empirical CDFs of p-values (弹窗, with grid)
+# Plot empirical CDFs of p-values 
 # ----------------------------
 stat_map = {"lrt": "LRT", "auc": "AUC", "mce": "MCE"}
 
@@ -154,7 +154,7 @@ for key, title in stat_map.items():
     ax.set_ylabel("Empirical CDF")
     ax.set_title(f"{title} p-value CDF")
     ax.legend(loc="lower right")
-    ax.grid(True, linestyle='--', alpha=0.7)  # 加网格
+    ax.grid(True, linestyle='--', alpha=0.7)  
     plt.tight_layout()
     plt.show()
 
